@@ -3,16 +3,16 @@ from openai import OpenAI
 from PIL import Image
 import requests
 import datetime
+import pandas as pd
 
 # =====================================================
 # 기본 설정
 # =====================================================
 st.set_page_config(page_title="하루의 단서", layout="centered")
 st.title("📸 하루의 단서")
-st.caption("사진과 선택으로 하루의 감정 흐름을 기록합니다")
 
 # =====================================================
-# 사이드바 - API KEY 입력
+# 사이드바 - API KEY
 # =====================================================
 st.sidebar.header("🔑 API 설정")
 
@@ -22,166 +22,143 @@ weather_key = st.sidebar.text_input("OpenWeatherMap API Key", type="password")
 client = OpenAI(api_key=openai_key) if openai_key else None
 
 # =====================================================
-# 세션 상태
+# 세션 상태 (데이터 저장용)
 # =====================================================
+if "records" not in st.session_state:
+    st.session_state.records = []
+
 if "custom_emotions" not in st.session_state:
-    st.session_state.custom_emotions = []
+    st.session_state.custom_emotions = {}
 
 # =====================================================
-# 날씨 API (맥락 정보용)
+# 맥락별 감정 풀 (오류 방지 핵심)
 # =====================================================
-def get_weather(city="Seoul"):
-    if not weather_key:
-        return None
-    url = (
-        f"https://api.openweathermap.org/data/2.5/weather"
-        f"?q={city}&appid={weather_key}&units=metric&lang=kr"
-    )
-    res = requests.get(url).json()
-    if "weather" in res:
-        return {
-            "desc": res["weather"][0]["description"],
-            "temp": res["main"]["temp"]
-        }
-    return None
-
-weather = get_weather()
+CONTEXT_EMOTIONS = {
+    "식사": ["😋 맛있음", "🙂 괜찮았음", "😕 아쉬움", "💸 가격이 아까움"],
+    "풍경": ["🌿 차분함", "✨ 인상 깊음", "🙂 그냥 그랬음"],
+    "휴식": ["😌 편안함", "🙂 만족스러움", "😴 나른함"],
+    "이동": ["😴 피곤함", "😐 무난함", "😤 지침"],
+    "여가": ["😆 즐거움", "🙂 만족", "😐 평범함"]
+}
 
 # =====================================================
-# OpenAI - 감정 선택지 생성
+# OpenAI - 사진 맥락 분류만
 # =====================================================
-def generate_emotions(context_text):
-    """
-    감정을 추론하지 않고
-    선택 가능한 표현만 생성
-    """
-    # API 키 없을 때 기본값
+def classify_context():
     if client is None:
-        return ["🙂 평범함", "😐 그냥 그랬음", "😌 차분함", "😴 피곤함"]
-
-    prompt = f"""
-    사용자의 일상 기록을 위한 감정 선택지를 생성하라.
-
-    규칙:
-    - 감정을 추론하거나 판단하지 말 것
-    - 중립적인 표현 사용
-    - 아이콘 + 짧은 텍스트
-    - 4~6개만 제시
-
-    상황 설명:
-    {context_text}
+        return "일상"
+    prompt = """
+    이 이미지는 사용자의 일상 사진이다.
+    다음 중 하나로만 분류하라:
+    [식사, 풍경, 휴식, 이동, 여가]
+    단어 하나만 출력하라.
     """
-
-    response = client.responses.create(
+    res = client.responses.create(
         model="gpt-4o-mini",
         input=prompt
     )
-
-    text = response.output_text
-    emotions = []
-
-    for line in text.split("\n"):
-        line = line.strip()
-        if line:
-            emotions.append(line)
-
-    return emotions[:6]
+    return res.output_text.strip()
 
 # =====================================================
-# 기록 입력 UI
+# 기록 날짜 (과거만 허용)
+# =====================================================
+record_date = st.date_input(
+    "📅 기록할 날짜",
+    value=datetime.date.today(),
+    max_value=datetime.date.today()
+)
+
+# =====================================================
+# 하루 에너지 점수 (1회)
+# =====================================================
+energy = st.slider(
+    "🔋 오늘의 에너지 수준",
+    min_value=1,
+    max_value=10,
+    value=5
+)
+
+# =====================================================
+# 사진 기록
 # =====================================================
 st.header("📝 오늘의 기록")
 
-mode = st.radio(
-    "기록 방식 선택",
-    ["사진으로 기록", "사진 없이 감정만 기록"]
+images = st.file_uploader(
+    "하루의 사진 (최대 3장)",
+    type=["jpg", "png"],
+    accept_multiple_files=True
 )
 
-records = []
+images = images[:3]
+daily_records = []
 
-# -------------------------------
-# 📸 사진으로 기록
-# -------------------------------
-if mode == "사진으로 기록":
-    images = st.file_uploader(
-        "하루의 사진 (최대 3장)",
-        type=["jpg", "png"],
-        accept_multiple_files=True
+for idx, img in enumerate(images):
+    st.subheader(f"사진 {idx + 1}")
+    image = Image.open(img)
+    st.image(image, use_column_width=True)
+
+    context = classify_context()
+    emotions = CONTEXT_EMOTIONS.get(context, ["🙂 평범함"])
+
+    # 사용자 주관식 감정 재사용
+    if context in st.session_state.custom_emotions:
+        emotions += st.session_state.custom_emotions[context]
+
+    emotion = st.radio(
+        "감정 선택 (1개)",
+        emotions,
+        key=f"emotion_{idx}"
     )
 
-    images = images[:3]
-
-    for idx, img in enumerate(images):
-        st.subheader(f"사진 {idx + 1}")
-        image = Image.open(img)
-        st.image(image, use_column_width=True)
-
-        emotions = generate_emotions("일상 기록 사진")
-        emotions += st.session_state.custom_emotions
-
-        choice = st.radio(
-            "감정 선택 (1개)",
-            emotions,
-            key=f"emotion_{idx}"
-        )
-
-        custom = st.text_input(
-            "직접 입력 (선택)",
-            key=f"custom_{idx}"
-        )
-
-        if custom:
-            if custom not in st.session_state.custom_emotions:
-                st.session_state.custom_emotions.append(custom)
-            choice = custom
-
-        records.append({
-            "type": "photo",
-            "emotion": choice
-        })
-
-# -------------------------------
-# ✏️ 사진 없이 기록
-# -------------------------------
-else:
-    context = st.selectbox(
-        "오늘의 상황",
-        ["일상", "휴식", "이동", "여가", "기타"]
+    custom = st.text_input(
+        "직접 입력 (선택)",
+        key=f"custom_{idx}"
     )
 
-    emotions = generate_emotions(context)
-    emotions += st.session_state.custom_emotions
-
-    choice = st.radio("감정 선택 (1개)", emotions)
-
-    custom = st.text_input("직접 입력 (선택)")
     if custom:
-        if custom not in st.session_state.custom_emotions:
-            st.session_state.custom_emotions.append(custom)
-        choice = custom
+        st.session_state.custom_emotions.setdefault(context, [])
+        if custom not in st.session_state.custom_emotions[context]:
+            st.session_state.custom_emotions[context].append(custom)
+        emotion = custom
 
-    records.append({
-        "type": "text_only",
-        "emotion": choice
+    daily_records.append({
+        "date": record_date,
+        "context": context,
+        "emotion": emotion,
+        "energy": energy
     })
 
 # =====================================================
 # 저장
 # =====================================================
-if st.button("💾 오늘의 단서 저장"):
-    st.success("오늘의 기록을 저장했어요")
+if st.button("💾 기록 저장"):
+    st.session_state.records.extend(daily_records)
+    st.success("기록이 저장되었습니다")
 
-    st.markdown("### 📌 기록 요약")
-    for r in records:
-        st.write(f"- 감정: {r['emotion']}")
+# =====================================================
+# 리포트
+# =====================================================
+st.header("📊 리포트")
 
-    if weather:
-        st.write(f"🌤️ 날씨: {weather['desc']} / {weather['temp']}°C")
+if st.session_state.records:
+    df = pd.DataFrame(st.session_state.records)
+    df["date"] = pd.to_datetime(df["date"])
 
-    st.caption(f"📅 날짜: {datetime.date.today()}")
+    # 주별 리포트
+    st.subheader("🗓️ 주별 리포트")
+    df["week"] = df["date"].dt.isocalendar().week
+    weekly = df.groupby(["week", "emotion"]).size().unstack(fill_value=0)
+    st.bar_chart(weekly)
 
-    st.markdown("---")
-    st.caption(
-        "AI는 감정을 판단하지 않으며, "
-        "사용자가 선택한 표현만을 데이터로 저장합니다."
-    )
+    st.line_chart(df.groupby("week")["energy"].mean())
+
+    # 월별 리포트
+    st.subheader("📆 월별 리포트")
+    df["month"] = df["date"].dt.to_period("M").astype(str)
+    monthly = df.groupby(["month", "emotion"]).size().unstack(fill_value=0)
+    st.bar_chart(monthly)
+
+    st.line_chart(df.groupby("month")["energy"].mean())
+
+else:
+    st.info("아직 저장된 기록이 없습니다")
