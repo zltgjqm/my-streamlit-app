@@ -3,6 +3,7 @@ from openai import OpenAI
 from PIL import Image
 import datetime
 import pandas as pd
+import altair as alt
 from collections import Counter
 
 # =====================================================
@@ -39,7 +40,7 @@ CONTEXT_EMOTIONS = {
 }
 
 # =====================================================
-# OpenAI - 맥락 분류 (단어 하나)
+# OpenAI - 맥락 분류
 # =====================================================
 def classify_context():
     if client is None:
@@ -57,7 +58,7 @@ def classify_context():
     return res.output_text.strip()
 
 # =====================================================
-# 날짜 (과거만 허용)
+# 날짜 (과거만)
 # =====================================================
 record_date = st.date_input(
     "📅 기록할 날짜",
@@ -66,20 +67,17 @@ record_date = st.date_input(
 )
 
 # =====================================================
-# 에너지 체크 (필수)
+# 에너지 (필수)
 # =====================================================
-energy = st.slider(
-    "🔋 오늘의 에너지 (1~10)",
-    1, 10, 5
-)
+energy = st.slider("🔋 오늘의 에너지 (1~10)", 1, 10, 5)
 
 # =====================================================
-# 사진 + 감정 기록 (선택)
+# 사진 + 감정 (선택)
 # =====================================================
 st.header("📝 오늘의 기록 (선택)")
 
 images = st.file_uploader(
-    "하루의 사진 (최대 3장, 선택)",
+    "하루의 사진 (최대 3장)",
     type=["jpg", "png"],
     accept_multiple_files=True
 )
@@ -104,10 +102,7 @@ for idx, img in enumerate(images):
         key=f"emotion_{idx}"
     )
 
-    custom = st.text_input(
-        "직접 입력 (선택)",
-        key=f"custom_{idx}"
-    )
+    custom = st.text_input("직접 입력 (선택)", key=f"custom_{idx}")
 
     if custom:
         st.session_state.custom_emotions.setdefault(context, [])
@@ -118,18 +113,14 @@ for idx, img in enumerate(images):
     if emotion != "선택 안 함":
         daily_records.append({
             "date": record_date,
-            "context": context,
             "emotion": emotion,
             "energy": energy
         })
 
-# =====================================================
-# 에너지 단독 기록도 저장
-# =====================================================
+# 에너지만 기록
 if not daily_records:
     daily_records.append({
         "date": record_date,
-        "context": None,
         "emotion": None,
         "energy": energy
     })
@@ -152,32 +143,45 @@ if st.session_state.records:
     df["week"] = df["date"].dt.isocalendar().week
     df["month"] = df["date"].dt.to_period("M").astype(str)
 
-    # -----------------------------
-    # 에너지 리포트
-    # -----------------------------
+    # =================================================
+    # 에너지 리포트 (y축 1~10 고정)
+    # =================================================
     st.subheader("🔋 에너지 리포트")
 
     for period, label in [("week", "주별"), ("month", "월별")]:
         st.markdown(f"### {label}")
 
         grouped = df.groupby(period)
+        energy_df = grouped["energy"].mean().reset_index()
 
-        avg_energy = grouped["energy"].mean()
-        mode_energy = grouped["energy"].agg(lambda x: Counter(x).most_common(1)[0][0])
-        max_day = grouped.apply(lambda x: x.loc[x["energy"].idxmax(), "date"])
+        chart = (
+            alt.Chart(energy_df)
+            .mark_line(point=True)
+            .encode(
+                x=alt.X(f"{period}:O", title=label),
+                y=alt.Y(
+                    "energy:Q",
+                    title="평균 에너지",
+                    scale=alt.Scale(domain=[1, 10])
+                )
+            )
+        )
 
-        st.write("📈 평균 에너지")
-        st.line_chart(avg_energy)
+        st.altair_chart(chart, use_container_width=True)
 
+        mode_energy = grouped["energy"].agg(
+            lambda x: Counter(x).most_common(1)[0][0]
+        )
         st.write("📌 최빈 에너지")
         st.dataframe(mode_energy)
 
+        max_day = grouped.apply(lambda x: x.loc[x["energy"].idxmax(), "date"])
         st.write("⚡ 가장 에너지가 높았던 날")
         st.dataframe(max_day)
 
-    # -----------------------------
+    # =================================================
     # 감정 리포트
-    # -----------------------------
+    # =================================================
     st.subheader("💭 감정 리포트")
 
     emotion_df = df.dropna(subset=["emotion"])
@@ -186,17 +190,27 @@ if st.session_state.records:
         for period, label in [("week", "주별"), ("month", "월별")]:
             st.markdown(f"### {label}")
 
-            freq = emotion_df.groupby([period, "emotion"]).size().unstack(fill_value=0)
-            st.bar_chart(freq)
+            freq = emotion_df.groupby([period, "emotion"]).size().reset_index(name="count")
+
+            chart = (
+                alt.Chart(freq)
+                .mark_bar()
+                .encode(
+                    x=alt.X("emotion:N", title="감정"),
+                    y=alt.Y("count:Q", title="빈도"),
+                    color="emotion:N"
+                )
+            )
+
+            st.altair_chart(chart, use_container_width=True)
 
             most_common = emotion_df.groupby(period)["emotion"].agg(
                 lambda x: Counter(x).most_common(1)[0][0]
             )
             st.write("📌 가장 많이 선택된 감정")
             st.dataframe(most_common)
-
     else:
-        st.info("아직 감정 기록이 없습니다. 에너지 리포트만 표시됩니다.")
+        st.info("감정 기록이 없어 에너지 리포트만 표시됩니다.")
 
 else:
     st.info("아직 저장된 기록이 없습니다.")
