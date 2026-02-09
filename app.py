@@ -4,10 +4,12 @@ from PIL import Image
 import datetime
 import pandas as pd
 import altair as alt
-from collections import Counter, defaultdict
+from collections import Counter
 import base64
 import hashlib
 import calendar
+import random
+import requests
 
 # =====================================================
 # 기본 설정
@@ -38,8 +40,17 @@ if "records" not in st.session_state:
 if "custom_emotions" not in st.session_state:
     st.session_state.custom_emotions = {}
 
-if "stickers" not in st.session_state:
-    st.session_state.stickers = []  # earned badges
+# 포켓몬 도감: {pokemon_id: {"id":..,"name":..,"sprite":..}}
+if "pokedex" not in st.session_state:
+    st.session_state.pokedex = {}
+
+# 날짜별 포켓몬 획득 여부(하루 1마리 제한): set(["YYYY-MM-DD", ...])
+if "pokemon_claimed_dates" not in st.session_state:
+    st.session_state.pokemon_claimed_dates = set()
+
+# 달력에서 선택한 날짜
+if "selected_calendar_date" not in st.session_state:
+    st.session_state.selected_calendar_date = None
 
 # =====================================================
 # 맥락별 감정 풀 + 기본 감정 풀
@@ -52,28 +63,36 @@ CONTEXT_EMOTIONS = {
     "여가": ["😆 즐거움", "🙂 만족", "😐 평범함", "🤩 신남"],
     "기타": ["🙂 평범함", "😌 편안함", "😐 무덤덤", "😟 불안", "😆 즐거움", "😤 지침"]
 }
-
 DEFAULT_EMOTIONS = CONTEXT_EMOTIONS["기타"]
 ALLOWED_CONTEXTS = ["식사", "풍경", "휴식", "이동", "여가", "기타"]
-
-CONFIDENCE_THRESHOLD = 0.55  # 이 값보다 낮으면 애매 판정
+CONFIDENCE_THRESHOLD = 0.55
 
 # =====================================================
 # 유틸
 # =====================================================
+def safe_today() -> datetime.date:
+    return datetime.date.today()
+
 def image_to_data_url(pil_img: Image.Image) -> str:
-    """PIL 이미지를 data URL(base64)로 변환"""
     import io
     buf = io.BytesIO()
     pil_img.save(buf, format="PNG")
     b64 = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/png;base64,{b64}"
 
+def pil_to_b64_png(pil_img: Image.Image) -> str:
+    import io
+    buf = io.BytesIO()
+    pil_img.save(buf, format="PNG")
+    return base64.b64encode(buf.getvalue()).decode("utf-8")
+
+def b64_to_pil(b64_str: str) -> Image.Image:
+    import io
+    raw = base64.b64decode(b64_str)
+    return Image.open(io.BytesIO(raw))
+
 def make_photo_id(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()[:12]
-
-def safe_today() -> datetime.date:
-    return datetime.date.today()
 
 # =====================================================
 # OpenAI - 이미지 기반 맥락 분류 + confidence
@@ -112,7 +131,6 @@ def classify_context_with_confidence(pil_img: Image.Image) -> tuple[str, float]:
             ],
         )
         text = res.output_text.strip()
-        # 매우 단순 파서(안정성 위해 try)
         import json
         obj = json.loads(text)
         ctx = obj.get("context", "기타")
@@ -125,96 +143,100 @@ def classify_context_with_confidence(pil_img: Image.Image) -> tuple[str, float]:
         return ("기타", 0.0)
 
 # =====================================================
-# Streak / Sticker 로직
+# 포켓몬 (PokeAPI) - 1세대 랜덤 획득
 # =====================================================
-STICKER_RULES = [
-    (3, "🥉 3일 연속 기록"),
-    (7, "🥈 7일 연속 기록"),
-    (14, "🥇 14일 연속 기록"),
-    (30, "🏆 30일 연속 기록"),
-]
-
-def compute_streak(records_df: pd.DataFrame) -> int:
-    """오늘 기준으로 '연속 기록' 계산. (하루에 기록 하나라도 있으면 기록한 날로 침)"""
-    if records_df.empty:
-        return 0
-    days = sorted(set(records_df["date"].dt.date.tolist()))
-    if not days:
-        return 0
-
-    today = safe_today()
-    # 오늘 기록이 없으면 '어제'까지 streak를 보여주고 싶으면 아래를 바꾸면 됨
-    # 여기서는 "마지막 기록일부터 연속"으로 계산하되, 마지막 기록이 오늘/어제인지에 따라 달라짐
-    last = days[-1]
-
-    # 마지막 기록이 오늘도 아니고 어제도 아니면 streak는 1(마지막 날만)로 처리할지 0으로 처리할지 선택인데,
-    # 보통 streak는 끊겼다고 보는 게 자연스러워서 0으로 둠.
-    if last not in [today, today - datetime.timedelta(days=1)]:
-        return 0
-
-    streak = 1
-    cur = last
-    dayset = set(days)
-    while (cur - datetime.timedelta(days=1)) in dayset:
-        streak += 1
-        cur = cur - datetime.timedelta(days=1)
-    return streak
-
-def award_stickers(streak: int):
-    """st.session_state.stickers에 중복 없이 추가"""
-    earned = set(st.session_state.stickers)
-    for n, label in STICKER_RULES:
-        if streak >= n and label not in earned:
-            st.session_state.stickers.append(label)
-
-# =====================================================
-# 달력 렌더링
-# =====================================================
-def build_month_calendar(year: int, month: int, day_to_emotion: dict[int, str]) -> str:
+def get_pokemon() -> dict:
     """
-    HTML 달력 생성: 각 날짜 칸에 감정 텍스트 표시
-    day_to_emotion: {day: "😆 즐거움"} 형태
+    PokeAPI에서 1~151 랜덤 포켓몬 가져오기
+    return: {"id": int, "name": str, "sprite": str|None}
     """
-    cal = calendar.Calendar(firstweekday=0)  # Monday=0 in python? actually 0=Monday in calendar module
+    poke_id = random.randint(1, 151)
+    url = f"https://pokeapi.co/api/v2/pokemon/{poke_id}"
+    r = requests.get(url, timeout=10)
+    r.raise_for_status()
+    data = r.json()
+    sprite = None
+    # 기본 스프라이트(정면)
+    if data.get("sprites"):
+        sprite = data["sprites"].get("front_default")
+    return {"id": data["id"], "name": data["name"], "sprite": sprite}
+
+def claim_pokemon_for_date(date_obj: datetime.date) -> tuple[bool, dict | None, str | None]:
+    """
+    해당 날짜에 포켓몬을 아직 안 받았으면 지급.
+    return: (claimed_now, pokemon_dict, error_msg)
+    """
+    date_key = date_obj.isoformat()
+    if date_key in st.session_state.pokemon_claimed_dates:
+        return (False, None, None)
+
+    try:
+        p = get_pokemon()
+        st.session_state.pokemon_claimed_dates.add(date_key)
+        # 도감에 등록(중복 포켓몬이면 이미 있던 걸 유지)
+        if p["id"] not in st.session_state.pokedex:
+            st.session_state.pokedex[p["id"]] = p
+        return (True, p, None)
+    except Exception as e:
+        return (False, None, f"포켓몬 지급 중 오류: {e}")
+
+# =====================================================
+# 리마인드 배너 (사용 빈도 기반)
+# =====================================================
+def show_reminder_banner():
+    if not st.session_state.records:
+        if usage_mode == "매일":
+            st.info("👋 첫 기록을 남겨보세요! 사진 없어도 에너지 기록만으로 포켓몬을 얻을 수 있어요.")
+        return
+
+    tmpdf = pd.DataFrame(st.session_state.records)
+    tmpdf["date"] = pd.to_datetime(tmpdf["date"])
+    last_day = tmpdf["date"].max().date()
+    gap = (safe_today() - last_day).days
+
+    if usage_mode == "매일" and gap >= 1:
+        st.warning(f"⏰ 마지막 기록이 {gap}일 전({last_day})이에요. 오늘 에너지라도 남기고 포켓몬 받자!")
+    elif usage_mode == "주 2~3회" and gap >= 4:
+        st.info(f"💡 최근 기록이 조금 뜸해요. 마지막 기록: {last_day}")
+
+# =====================================================
+# 달력 UI (버튼 클릭)
+# =====================================================
+def render_month_calendar_buttons(year: int, month: int, day_to_label: dict[int, str]):
+    """
+    7열 그리드 버튼 달력.
+    day_to_label: 각 날짜에 표시할 감정 라벨(짧게)
+    """
+    st.write(f"**{year}년 {month}월**")
+
+    headers = ["월", "화", "수", "목", "금", "토", "일"]
+    cols = st.columns(7)
+    for i, h in enumerate(headers):
+        cols[i].markdown(f"**{h}**")
+
+    cal = calendar.Calendar(firstweekday=0)  # 월요일 시작
     weeks = cal.monthdayscalendar(year, month)
 
-    # 약간의 스타일
-    style = """
-    <style>
-    .cal {border-collapse: collapse; width: 100%; table-layout: fixed;}
-    .cal th {padding: 8px; border: 1px solid #ddd; background: #f7f7f7; font-size: 14px;}
-    .cal td {vertical-align: top; padding: 8px; border: 1px solid #ddd; height: 86px; font-size: 13px;}
-    .cal .day {font-weight: 700; margin-bottom: 6px;}
-    .cal .emo {margin-top: 6px; line-height: 1.2;}
-    .cal .muted {color: #999;}
-    </style>
-    """
-
-    # 요일 헤더 (월화수목금토일)
-    headers = ["월", "화", "수", "목", "금", "토", "일"]
-
-    html = [style, "<table class='cal'>"]
-    html.append("<thead><tr>" + "".join([f"<th>{h}</th>" for h in headers]) + "</tr></thead>")
-    html.append("<tbody>")
-
     for w in weeks:
-        html.append("<tr>")
-        for d in w:
+        row = st.columns(7)
+        for i, d in enumerate(w):
             if d == 0:
-                html.append("<td class='muted'></td>")
-            else:
-                emo = day_to_emotion.get(d, "")
-                emo_html = f"<div class='emo'>{emo}</div>" if emo else "<div class='emo muted'>—</div>"
-                html.append(f"<td><div class='day'>{d}</div>{emo_html}</td>")
-        html.append("</tr>")
+                row[i].markdown(" ")
+                continue
 
-    html.append("</tbody></table>")
-    return "\n".join(html)
+            label = day_to_label.get(d, "—")
+            # 버튼 텍스트를 너무 길게 하지 않기 위해 줄바꿈
+            btn_text = f"{d}\n{label}"
+            key = f"calbtn_{year}_{month}_{d}"
+
+            if row[i].button(btn_text, key=key):
+                st.session_state.selected_calendar_date = datetime.date(year, month, d)
 
 # =====================================================
 # 입력 UI
 # =====================================================
 st.header("🗓️ 오늘 기록")
+show_reminder_banner()
 
 record_date = st.date_input(
     "📅 기록할 날짜",
@@ -226,34 +248,15 @@ energy = st.slider("🔋 오늘의 에너지 (1~10)", 1, 10, 5)
 
 st.subheader("📝 사진 + 감정 (선택)")
 images = st.file_uploader(
-    "하루의 사진 (최대 3장)",
+    "하루의 사진 (최대 3장) - 없어도 OK",
     type=["jpg", "png", "jpeg"],
     accept_multiple_files=True
 )
-images = images[:3]
+images = (images or [])[:3]
 
 daily_records = []
 
-# =====================================================
-# 리마인드 배너 (사용 빈도 기반)
-# =====================================================
-if st.session_state.records:
-    tmpdf = pd.DataFrame(st.session_state.records)
-    tmpdf["date"] = pd.to_datetime(tmpdf["date"])
-    last_day = tmpdf["date"].max().date()
-    gap = (safe_today() - last_day).days
-
-    if usage_mode == "매일" and gap >= 1:
-        st.warning(f"⏰ 마지막 기록이 {gap}일 전({last_day})이에요. 오늘 한 줄이라도 남겨볼까요?")
-    elif usage_mode == "주 2~3회" and gap >= 4:
-        st.info(f"💡 최근 기록이 조금 뜸해요. 마지막 기록: {last_day}")
-else:
-    if usage_mode == "매일":
-        st.info("👋 첫 기록을 남겨보세요! 매일 한 번이면 충분해요.")
-
-# =====================================================
 # 사진별 입력
-# =====================================================
 for idx, img in enumerate(images):
     st.markdown("---")
     st.subheader(f"사진 {idx + 1}")
@@ -266,7 +269,6 @@ for idx, img in enumerate(images):
 
     ai_ctx, ai_conf = classify_context_with_confidence(image)
 
-    # 사용자가 맥락을 직접 수정할 수 있게
     st.caption(f"🤖 AI 추천 맥락: **{ai_ctx}** (confidence={ai_conf:.2f})")
     chosen_ctx = st.selectbox(
         "맥락 선택(수정 가능)",
@@ -275,13 +277,10 @@ for idx, img in enumerate(images):
         key=f"context_{idx}"
     )
 
-    # confidence 낮거나 사용자가 기타로 바꾸면 기본 감정 세트에 더 무게
     emotions = CONTEXT_EMOTIONS.get(chosen_ctx, DEFAULT_EMOTIONS).copy()
     if ai_conf < CONFIDENCE_THRESHOLD:
-        # 애매하면 기본 감정도 함께 보여주기(안정성)
         emotions = list(dict.fromkeys(emotions + DEFAULT_EMOTIONS))
 
-    # 사용자 커스텀 감정 누적
     if chosen_ctx in st.session_state.custom_emotions:
         emotions += st.session_state.custom_emotions[chosen_ctx]
         emotions = list(dict.fromkeys(emotions))
@@ -293,32 +292,36 @@ for idx, img in enumerate(images):
     )
 
     custom = st.text_input("직접 입력 (선택)  예: 😮 뿌듯함 / 😔 아쉬움", key=f"custom_{idx}")
-
     if custom:
         st.session_state.custom_emotions.setdefault(chosen_ctx, [])
         if custom not in st.session_state.custom_emotions[chosen_ctx]:
             st.session_state.custom_emotions[chosen_ctx].append(custom)
         emotion = custom
 
-    # 기록 저장용 row
-    if emotion != "선택 안 함":
-        daily_records.append({
-            "date": record_date,
-            "photo_id": photo_id,
-            "context": chosen_ctx,
-            "ai_context": ai_ctx,
-            "ai_confidence": float(ai_conf),
-            "emotion": emotion,
-            "energy": energy
-        })
+    # 사진 자체도 저장(달력 상세 보기용)
+    image_b64 = pil_to_b64_png(image)
 
-# 사진이 없거나, 사진은 있는데 감정 선택을 안했으면 에너지만 기록 가능
-if not daily_records:
-    st.markdown("---")
-    st.caption("사진/감정을 선택하지 않아도 에너지만 기록할 수 있어요.")
+    # 감정 선택 안 해도 사진 기록은 남길지 여부는 취향인데,
+    # 여기서는 "감정 선택한 경우만" 감정 row로 저장하고,
+    # 사진은 저장하되 emotion=None으로 저장해도 상세 보기에는 보일 수 있게 하자.
+    daily_records.append({
+        "date": record_date,
+        "photo_id": photo_id,
+        "image_b64": image_b64,
+        "context": chosen_ctx,
+        "ai_context": ai_ctx,
+        "ai_confidence": float(ai_conf),
+        "emotion": None if emotion == "선택 안 함" else emotion,
+        "energy": energy
+    })
+
+# 사진이 없으면 에너지만 기록
+if not images:
+    st.caption("사진을 올리지 않아도 에너지 기록만으로 포켓몬을 얻을 수 있어요.")
     daily_records.append({
         "date": record_date,
         "photo_id": None,
+        "image_b64": None,
         "context": None,
         "ai_context": None,
         "ai_confidence": None,
@@ -327,155 +330,226 @@ if not daily_records:
     })
 
 # =====================================================
-# 저장
+# 저장 (저장 시 포켓몬 지급)
 # =====================================================
 if st.button("💾 기록 저장"):
     st.session_state.records.extend(daily_records)
     st.success("기록이 저장되었습니다 ✅")
 
-    # 저장 후 streak/sticker 계산
-    df_tmp = pd.DataFrame(st.session_state.records)
-    df_tmp["date"] = pd.to_datetime(df_tmp["date"])
-    streak = compute_streak(df_tmp)
-    award_stickers(streak)
+    claimed, p, err = claim_pokemon_for_date(record_date)
+    if err:
+        st.error(err)
+    elif claimed:
+        st.balloons()
+        st.success(f"🎁 오늘의 포켓몬 GET!  #{p['id']}  {p['name']}")
+        if p.get("sprite"):
+            st.image(p["sprite"], width=120)
+    else:
+        st.info("오늘은 이미 포켓몬을 받았어요! (하루 1마리)")
 
 # =====================================================
-# 사이드바: streak + stickers
+# 사이드바: 포켓몬 진행도
 # =====================================================
-st.sidebar.header("🔥 연속 기록 / 스티커")
-if st.session_state.records:
-    df_side = pd.DataFrame(st.session_state.records)
-    df_side["date"] = pd.to_datetime(df_side["date"])
-    cur_streak = compute_streak(df_side)
-    st.sidebar.metric("현재 연속 기록", f"{cur_streak}일")
-else:
-    st.sidebar.metric("현재 연속 기록", "0일")
-
-if st.session_state.stickers:
-    st.sidebar.write("획득한 스티커:")
-    for s in st.session_state.stickers[::-1]:
-        st.sidebar.write(f"- {s}")
-else:
-    st.sidebar.write("아직 스티커가 없어요. 3일 연속부터 지급!")
+st.sidebar.header("🧡 포켓몬 도감")
+st.sidebar.metric("획득", f"{len(st.session_state.pokedex)}/151")
+if st.session_state.pokedex:
+    # 최근 획득 몇 개 보여주기(최대 5)
+    recent = sorted(st.session_state.pokedex.values(), key=lambda x: x["id"], reverse=True)[:5]
+    st.sidebar.write("최근 도감 등록:")
+    for p in recent:
+        if p.get("sprite"):
+            st.sidebar.image(p["sprite"], width=60)
+        st.sidebar.write(f"#{p['id']} {p['name']}")
 
 # =====================================================
 # 리포트
 # =====================================================
 st.header("📊 리포트")
 
-if st.session_state.records:
-    df = pd.DataFrame(st.session_state.records)
-    df["date"] = pd.to_datetime(df["date"])
-    df["week"] = df["date"].dt.isocalendar().week
-    df["month"] = df["date"].dt.to_period("M").astype(str)
+if not st.session_state.records:
+    st.info("아직 저장된 기록이 없습니다.")
+    st.stop()
 
-    # -------------------------------------------------
-    # 월간 달력 뷰
-    # -------------------------------------------------
-    st.subheader("🗓️ 한 달 달력 보기")
+df = pd.DataFrame(st.session_state.records)
+df["date"] = pd.to_datetime(df["date"])
+df["week"] = df["date"].dt.isocalendar().week
+df["month"] = df["date"].dt.to_period("M").astype(str)
 
-    # 달 선택: 기록이 있으면 해당 달 우선
-    months_available = sorted(df["month"].unique().tolist())
-    default_month = df["month"].max()
-    selected_month = st.selectbox("표시할 달", months_available, index=months_available.index(default_month))
+# -------------------------------------------------
+# 월간 달력 (클릭 가능)
+# -------------------------------------------------
+st.subheader("🗓️ 한 달 달력 보기 (날짜 클릭 → 상세)")
+months_available = sorted(df["month"].unique().tolist())
+default_month = df["month"].max()
+selected_month = st.selectbox("표시할 달", months_available, index=months_available.index(default_month))
 
-    year, month = map(int, selected_month.split("-"))
-    mdf = df[df["month"] == selected_month].copy()
+year, month = map(int, selected_month.split("-"))
+mdf = df[df["month"] == selected_month].copy()
 
-    # 날짜별 대표 감정(그날 여러 감정이면 최빈값)
-    day_to_emotion = {}
-    m_emotion = mdf.dropna(subset=["emotion"])
-    if not m_emotion.empty:
-        for day, g in m_emotion.groupby(m_emotion["date"].dt.day):
-            # 최빈 감정
-            emo = Counter(g["emotion"].tolist()).most_common(1)[0][0]
-            day_to_emotion[int(day)] = emo
+# 날짜별 대표 감정(그날 여러 감정이면 최빈)
+day_to_label = {}
+m_emotion = mdf.dropna(subset=["emotion"])
+if not m_emotion.empty:
+    for day, g in m_emotion.groupby(m_emotion["date"].dt.day):
+        emo = Counter(g["emotion"].tolist()).most_common(1)[0][0]
+        # 달력 라벨은 너무 길면 보기 힘드니 앞쪽만
+        day_to_label[int(day)] = emo
 
-    cal_html = build_month_calendar(year, month, day_to_emotion)
-    st.markdown(cal_html, unsafe_allow_html=True)
+render_month_calendar_buttons(year, month, day_to_label)
 
-    # -------------------------------------------------
-    # 에너지 리포트
-    # -------------------------------------------------
-    st.subheader("🔋 에너지 리포트")
+# -------------------------------------------------
+# 날짜 클릭 시 상세 보기
+# -------------------------------------------------
+st.markdown("---")
+st.subheader("🔎 선택한 날짜 상세 보기")
 
+if st.session_state.selected_calendar_date is None:
+    st.info("달력에서 날짜를 클릭해 주세요.")
+else:
+    sel = st.session_state.selected_calendar_date
+    st.write(f"**선택 날짜:** {sel.isoformat()}")
+
+    day_df = df[df["date"].dt.date == sel].copy()
+    if day_df.empty:
+        st.info("해당 날짜 기록이 없습니다.")
+    else:
+        # 에너지(그날 여러 row면 동일하다고 가정하지만 안전하게 최빈/평균)
+        st.metric("에너지", float(day_df["energy"].mean()))
+
+        # 포켓몬 획득 여부
+        if sel.isoformat() in st.session_state.pokemon_claimed_dates:
+            st.success("🎁 이 날은 포켓몬을 획득한 날이에요!")
+        else:
+            st.warning("이 날은 포켓몬을 아직 못 받았어요(기록 저장하면 받을 수 있음).")
+
+        # 사진/감정 리스트
+        # photo_id 없는(에너지만) row는 별도 표시
+        photo_rows = day_df[day_df["image_b64"].notna()].copy()
+        energy_only = day_df[day_df["image_b64"].isna()].copy()
+
+        if not energy_only.empty and photo_rows.empty:
+            st.info("사진 없이 에너지만 기록한 날이에요.")
+
+        if not photo_rows.empty:
+            st.write("**사진 기록**")
+            for i, r in photo_rows.iterrows():
+                cols = st.columns([1, 2])
+                # 이미지
+                try:
+                    pil = b64_to_pil(r["image_b64"])
+                    cols[0].image(pil, use_column_width=True)
+                except Exception:
+                    cols[0].write("(이미지 표시 실패)")
+
+                # 메타
+                ctx = r.get("context")
+                emo = r.get("emotion")
+                ai_ctx = r.get("ai_context")
+                ai_conf = r.get("ai_confidence")
+
+                meta_lines = []
+                if ctx:
+                    meta_lines.append(f"- 맥락: **{ctx}**")
+                if emo:
+                    meta_lines.append(f"- 감정: **{emo}**")
+                else:
+                    meta_lines.append(f"- 감정: (선택 안 함)")
+                if ai_ctx:
+                    meta_lines.append(f"- AI 추천: {ai_ctx} (conf={ai_conf:.2f})" if ai_conf is not None else f"- AI 추천: {ai_ctx}")
+                cols[1].markdown("\n".join(meta_lines))
+
+# -------------------------------------------------
+# 에너지 리포트
+# -------------------------------------------------
+st.markdown("---")
+st.subheader("🔋 에너지 리포트")
+
+for period, label in [("week", "주별"), ("month", "월별")]:
+    st.markdown(f"### {label}")
+    grouped = df.groupby(period)
+    energy_df = grouped["energy"].mean().reset_index()
+
+    chart = (
+        alt.Chart(energy_df)
+        .mark_line(point=True)
+        .encode(
+            x=alt.X(f"{period}:O", title=label),
+            y=alt.Y("energy:Q", title="평균 에너지", scale=alt.Scale(domain=[1, 10]))
+        )
+    )
+    st.altair_chart(chart, use_container_width=True)
+
+# -------------------------------------------------
+# 감정 + 활동(맥락) 리포트
+# -------------------------------------------------
+st.markdown("---")
+st.subheader("💭 감정 리포트")
+
+emotion_df = df.dropna(subset=["emotion"]).copy()
+if emotion_df.empty:
+    st.info("감정 기록이 없어 에너지 리포트만 표시됩니다.")
+else:
+    # 주/월별 감정 빈도
     for period, label in [("week", "주별"), ("month", "월별")]:
-        st.markdown(f"### {label}")
-
-        grouped = df.groupby(period)
-        energy_df = grouped["energy"].mean().reset_index()
-
+        st.markdown(f"### {label} 감정 빈도")
+        freq = emotion_df.groupby([period, "emotion"]).size().reset_index(name="count")
         chart = (
-            alt.Chart(energy_df)
-            .mark_line(point=True)
+            alt.Chart(freq)
+            .mark_bar()
             .encode(
-                x=alt.X(f"{period}:O", title=label),
-                y=alt.Y("energy:Q", title="평균 에너지", scale=alt.Scale(domain=[1, 10]))
+                x=alt.X("emotion:N", title="감정"),
+                y=alt.Y("count:Q", title="빈도"),
+                color="emotion:N"
             )
         )
         st.altair_chart(chart, use_container_width=True)
 
-        mode_energy = grouped["energy"].agg(lambda x: Counter(x).most_common(1)[0][0])
-        st.write("📌 최빈 에너지")
-        st.dataframe(mode_energy)
-
-        max_day = grouped.apply(lambda x: x.loc[x["energy"].idxmax(), "date"])
-        st.write("⚡ 가장 에너지가 높았던 날")
-        st.dataframe(max_day)
-
-    # -------------------------------------------------
-    # 감정 리포트 + 활동(맥락)별 감정 비율
-    # -------------------------------------------------
-    st.subheader("💭 감정 리포트")
-
-    emotion_df = df.dropna(subset=["emotion"]).copy()
-    if not emotion_df.empty:
-        # (1) 주/월별 감정 빈도
-        for period, label in [("week", "주별"), ("month", "월별")]:
-            st.markdown(f"### {label} 감정 빈도")
-
-            freq = emotion_df.groupby([period, "emotion"]).size().reset_index(name="count")
-            chart = (
-                alt.Chart(freq)
-                .mark_bar()
-                .encode(
-                    x=alt.X("emotion:N", title="감정"),
-                    y=alt.Y("count:Q", title="빈도"),
-                    color="emotion:N"
-                )
-            )
-            st.altair_chart(chart, use_container_width=True)
-
-            most_common = emotion_df.groupby(period)["emotion"].agg(lambda x: Counter(x).most_common(1)[0][0])
-            st.write("📌 가장 많이 선택된 감정")
-            st.dataframe(most_common)
-
-        # (2) 활동 유형별 감정 비율(맥락이 있는 기록만)
-        st.markdown("### 활동(맥락) 유형별 감정 비율")
-        ctx_df = emotion_df.dropna(subset=["context"]).copy()
-        if not ctx_df.empty:
-            ctx_freq = ctx_df.groupby(["context", "emotion"]).size().reset_index(name="count")
-
-            # 비율 계산
-            ctx_total = ctx_freq.groupby("context")["count"].transform("sum")
-            ctx_freq["ratio"] = ctx_freq["count"] / ctx_total
-
-            chart2 = (
-                alt.Chart(ctx_freq)
-                .mark_bar()
-                .encode(
-                    x=alt.X("context:N", title="활동(맥락)"),
-                    y=alt.Y("ratio:Q", title="비율"),
-                    color="emotion:N",
-                    tooltip=["context", "emotion", "count", alt.Tooltip("ratio:Q", format=".0%")]
-                )
-            )
-            st.altair_chart(chart2, use_container_width=True)
-        else:
-            st.info("맥락이 저장된 감정 기록이 아직 없어요.")
-
+    # 활동(맥락) 유형별 감정 비율
+    st.markdown("### 활동(맥락) 유형별 감정 비율")
+    ctx_df = emotion_df.dropna(subset=["context"]).copy()
+    if ctx_df.empty:
+        st.info("맥락이 저장된 감정 기록이 아직 없어요.")
     else:
-        st.info("감정 기록이 없어 에너지 리포트만 표시됩니다.")
+        ctx_freq = ctx_df.groupby(["context", "emotion"]).size().reset_index(name="count")
+        ctx_total = ctx_freq.groupby("context")["count"].transform("sum")
+        ctx_freq["ratio"] = ctx_freq["count"] / ctx_total
 
+        chart2 = (
+            alt.Chart(ctx_freq)
+            .mark_bar()
+            .encode(
+                x=alt.X("context:N", title="활동(맥락)"),
+                y=alt.Y("ratio:Q", title="비율"),
+                color="emotion:N",
+                tooltip=["context", "emotion", "count", alt.Tooltip("ratio:Q", format=".0%")]
+            )
+        )
+        st.altair_chart(chart2, use_container_width=True)
+
+# =====================================================
+# 맨 아래: 내 포켓몬 도감
+# =====================================================
+st.markdown("---")
+st.header("📚 나의 포켓몬 도감 (획득한 포켓몬)")
+
+if not st.session_state.pokedex:
+    st.info("아직 획득한 포켓몬이 없어요. 기록 저장하면 하루 1마리씩 얻을 수 있어요!")
 else:
-    st.info("아직 저장된 기록이 없습니다.")
+    pokes = sorted(st.session_state.pokedex.values(), key=lambda x: x["id"])
+    st.write(f"총 **{len(pokes)} / 151** 마리")
+
+    # 그리드 표시(4열)
+    cols_per_row = 4
+    for i in range(0, len(pokes), cols_per_row):
+        row = st.columns(cols_per_row)
+        chunk = pokes[i:i+cols_per_row]
+        for j in range(cols_per_row):
+            if j >= len(chunk):
+                row[j].write("")
+                continue
+            p = chunk[j]
+            if p.get("sprite"):
+                row[j].image(p["sprite"], width=120)
+            row[j].markdown(f"**#{p['id']} {p['name']}**")
+
+    st.caption("포켓몬 이름은 PokeAPI 원문(영문)입니다. 원하면 한글 이름 매핑도 붙여줄게요.")
